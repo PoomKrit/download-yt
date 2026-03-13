@@ -182,7 +182,7 @@ func (m model) View() string {
 	case stateInput:
 		return fmt.Sprintf(
 			"\n %s\n\n%s\n\n%s\n%s\n\n%s",
-			titleStyle.Render("YouTube Downloader (H.264 Only)"),
+			titleStyle.Render("YouTube Downloader"),
 			m.textInput.View(),
 			"Enter a single URL, multiple URLs (comma-separated), or a path to a .txt file.",
 			"Example: https://youtu.be/abc, https://youtu.be/xyz",
@@ -205,7 +205,7 @@ func (m model) View() string {
 }
 
 func getVideoTitle(url string) string {
-	cmd := exec.Command("bash", "-c", fmt.Sprintf("yt-dlp --get-title --cookies-from-browser chrome %s", url))
+	cmd := exec.Command("yt-dlp", "--get-title", "--cookies-from-browser", "chrome", url)
 	out, err := cmd.Output()
 	if err != nil {
 		return "Unknown Title"
@@ -215,14 +215,14 @@ func getVideoTitle(url string) string {
 
 func fetchFormatsAndMatch(url string, targetHeight int, isAudioOnly bool) (string, []fpsOption, string, error) {
 	title := getVideoTitle(url)
-	cmd := exec.Command("bash", "-c", fmt.Sprintf("yt-dlp -F --cookies-from-browser chrome %s", url))
+	cmd := exec.Command("yt-dlp", "-F", "--cookies-from-browser", "chrome", url)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return title, nil, "", fmt.Errorf("failed to fetch formats: %v", err)
 	}
 
 	lines := strings.Split(string(out), "\n")
-	var avcFormats []fpsOption
+	var videoFormats []fpsOption
 	var audioFormats []formatInfo
 
 	for _, line := range lines {
@@ -253,8 +253,8 @@ func fetchFormatsAndMatch(url string, targetHeight int, isAudioOnly bool) (strin
 			continue
 		}
 
-		// Filter for MP4 and AVC1
-		if strings.Contains(line, "video only") && ext == "mp4" && strings.Contains(line, "avc1") {
+		// Filter for video only, match resolution, and only allow mp4
+		if strings.Contains(line, "video only") && ext == "mp4" {
 			res := parts[2]
 			resParts := strings.Split(res, "x")
 			h := 0
@@ -262,15 +262,28 @@ func fetchFormatsAndMatch(url string, targetHeight int, isAudioOnly bool) (strin
 				h, _ = strconv.Atoi(resParts[1])
 			}
 
-			if h != targetHeight {
+			targetLabel := fmt.Sprintf("%dp", targetHeight)
+			// Match if exact height matches OR if the line contains the target label (e.g., "1080p")
+			if h != targetHeight && !strings.Contains(line, targetLabel) {
 				continue
 			}
 
 			fps := 0
 			if len(parts) > 3 {
-				if val, err := strconv.Atoi(parts[3]); err == nil {
+				// Remove any trailing non-digits from FPS (like 'fps')
+				fpsStr := regexp.MustCompile(`^\d+`).FindString(parts[3])
+				if val, err := strconv.Atoi(fpsStr); err == nil {
 					fps = val
 				}
+			}
+
+			codec := "unknown"
+			if strings.Contains(line, "avc1") {
+				codec = "H.264"
+			} else if strings.Contains(line, "vp9") {
+				codec = "VP9"
+			} else if strings.Contains(line, "av01") {
+				codec = "AV1"
 			}
 
 			note := ""
@@ -278,14 +291,27 @@ func fetchFormatsAndMatch(url string, targetHeight int, isAudioOnly bool) (strin
 				note = strings.TrimSpace(line[idx+1:])
 			}
 
-			avcFormats = append(avcFormats, fpsOption{
+			videoFormats = append(videoFormats, fpsOption{
 				id:    id,
 				fps:   fps,
-				label: fmt.Sprintf("%dfps", fps),
+				label: fmt.Sprintf("%dfps (%s, %s)", fps, codec, ext),
 				note:  note,
 			})
 		}
 	}
+
+	// Prioritize H.264 if available
+	sort.SliceStable(videoFormats, func(i, j int) bool {
+		iH264 := strings.Contains(videoFormats[i].label, "H.264")
+		jH264 := strings.Contains(videoFormats[j].label, "H.264")
+		if iH264 && !jH264 {
+			return true
+		}
+		if !iH264 && jH264 {
+			return false
+		}
+		return videoFormats[i].fps > videoFormats[j].fps
+	})
 
 	var selectedAudioID string
 	for _, f := range audioFormats {
@@ -304,7 +330,7 @@ func fetchFormatsAndMatch(url string, targetHeight int, isAudioOnly bool) (strin
 		}
 	}
 
-	return title, avcFormats, selectedAudioID, nil
+	return title, videoFormats, selectedAudioID, nil
 }
 
 type formatInfo struct {
@@ -455,7 +481,7 @@ func main() {
 		fmt.Printf("\nProcessing %d tasks...\n", len(preQueue))
 		for i, task := range preQueue {
 			fmt.Printf("\n[%d/%d] Fetching formats for: %s\n", i+1, len(preQueue), task.url)
-			title, avcFormats, audioID, err := fetchFormatsAndMatch(task.url, task.targetHeight, task.isAudioOnly)
+			title, videoFormats, audioID, err := fetchFormatsAndMatch(task.url, task.targetHeight, task.isAudioOnly)
 			if err != nil {
 				fmt.Printf("Error: %v. Retrying selection later.\n", err)
 				nextPassURLs = append(nextPassURLs, task.url)
@@ -465,11 +491,18 @@ func main() {
 			if task.isAudioOnly {
 				if audioID != "" {
 					fmt.Printf("Downloading Sound: %s\n", title)
-					cmdStr := fmt.Sprintf("yt-dlp -f %s --cookies-from-browser chrome -o '%%(title)s.%%(ext)s' %s", audioID, task.url)
-					cmd := exec.Command("bash", "-c", cmdStr)
+					args := []string{
+						"-f", audioID,
+						"--cookies-from-browser", "chrome",
+						"--no-overwrites",
+						"-o", "%(title)s.%(ext)s",
+						task.url,
+					}
+					cmd := exec.Command("yt-dlp", args...)
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
 					cmd.Run()
+					fmt.Println("Download finished.")
 				} else {
 					fmt.Println("No audio format found. Retrying selection later.")
 					nextPassURLs = append(nextPassURLs, task.url)
@@ -479,20 +512,20 @@ func main() {
 
 			// Video logic
 			var selectedVideoID string
-			if len(avcFormats) == 0 {
-				fmt.Printf("No H.264 format found for %dp. Retrying selection later.\n", task.targetHeight)
+			if len(videoFormats) == 0 {
+				fmt.Printf("No format found for %dp. Retrying selection later.\n", task.targetHeight)
 				nextPassURLs = append(nextPassURLs, task.url)
 				continue
-			} else if len(avcFormats) == 1 {
-				selectedVideoID = avcFormats[0].id
-				fmt.Printf("Auto-selected: %s (%s)\n", avcFormats[0].label, title)
+			} else if len(videoFormats) == 1 {
+				selectedVideoID = videoFormats[0].id
+				fmt.Printf("Auto-selected: %s (%s)\n", videoFormats[0].label, title)
 			} else {
-				items := make([]list.Item, len(avcFormats))
-				for j, f := range avcFormats {
+				items := make([]list.Item, len(videoFormats))
+				for j, f := range videoFormats {
 					items[j] = f
 				}
 				lFPS := list.New(items, list.NewDefaultDelegate(), 0, 0)
-				lFPS.Title = fmt.Sprintf("Multiple FPS found for %dp. Select for: %s", task.targetHeight, title)
+				lFPS.Title = fmt.Sprintf("Multiple formats found for %dp. Select for: %s", task.targetHeight, title)
 				mFPS := model{state: stateSelectFPS, list: lFPS, listReady: true}
 				pFPS := tea.NewProgram(mFPS, tea.WithAltScreen())
 				resFPS, _ := pFPS.Run()
@@ -505,11 +538,20 @@ func main() {
 
 			if selectedVideoID != "" && audioID != "" {
 				fmt.Printf("Downloading Clip: %s\n", title)
-				cmdStr := fmt.Sprintf("yt-dlp -f %s+%s --cookies-from-browser chrome --merge-output-format mp4 --postprocessor-args \"ffmpeg:-c:v copy -c:a copy -map 0:v:0 -map 1:a:0 -pix_fmt yuv420p -shortest\" -o '%%(title)s.%%(ext)s' %s", selectedVideoID, audioID, task.url)
-				cmd := exec.Command("bash", "-c", cmdStr)
+				args := []string{
+					"-f", fmt.Sprintf("%s+%s", selectedVideoID, audioID),
+					"--cookies-from-browser", "chrome",
+					"--no-overwrites",
+					"--merge-output-format", "mp4",
+					"--postprocessor-args", "ffmpeg:-y -c:v copy -c:a copy -map 0:v:0 -map 1:a:0 -pix_fmt yuv420p -shortest",
+					"-o", "%(title)s.%(ext)s",
+					task.url,
+				}
+				cmd := exec.Command("yt-dlp", args...)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 				cmd.Run()
+				fmt.Println("Download and merge finished.")
 			}
 		}
 
